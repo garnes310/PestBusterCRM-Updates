@@ -1,3 +1,67 @@
+name: Обновление приложения мастера
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Тег релиза, например master-v0.2.4
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: master-update-json
+  cancel-in-progress: false
+jobs:
+  update:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'master-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Проверить APK и обновить master-update.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          import base64, glob, json, os, re, subprocess, sys, tempfile, urllib.error, urllib.parse, urllib.request
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          if repo != 'garnes310/PestBusterCRM-Updates':
+              sys.exit('Этот сценарий настроен для репозитория PestBusterCRM-Updates.')
+          with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as f:
+              event = json.load(f)
+          if os.environ['GITHUB_EVENT_NAME'] == 'release':
+              tag = event['release']['tag_name']
+          else:
+              tag = event.get('inputs', {}).get('tag', '').strip()
+          if not re.fullmatch(r'master-v[0-9]+(?:\.[0-9]+){1,3}', tag):
+              sys.exit('Тег должен иметь вид master-v0.2.4.')
+          api = 'https://api.github.com/repos/' + repo
+          headers = {'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'master-update-workflow'}
+          def request(url, payload=None):
+              h = dict(headers)
+              if payload is not None:
+                  h['Content-Type'] = 'application/json'
+              req = urllib.request.Request(url, data=json.dumps(payload).encode() if payload is not None else None, headers=h, method='PUT' if payload is not None else 'GET')
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          release = request(api + '/releases/tags/' + urllib.parse.quote(tag, safe=''))
+          if release.get('draft') or release.get('prerelease') or not release.get('published_at'):
+              sys.exit('Нужен опубликованный релиз без отметки Pre-release.')
+          assets = [a for a in release.get('assets', []) if a.get('name') == 'app-pestbuster-release.apk' and a.get('state') == 'uploaded']
+          if len(assets) != 1:
+              sys.exit('В релизе должен быть один загруженный app-pestbuster-release.apk. Добавьте его и запустите проверку вручную.')
+          asset = assets[0]
+          if not 0 < asset['size'] <= 100 * 1024 * 1024:
+              sys.exit('Неожиданный размер APK.')
+          url = 'https://github.com/' + repo + '/releases/download/' + tag + '/app-pestbuster-release.apk'
+          if asset.get('browser_download_url') != url:
+              sys.exit('Адрес APK не совпадает с ожидаемым.')
+          tools = glob.glob(os.path.join(os.environ.get('ANDROID_HOME', os.environ.get('ANDROID_SDK_ROOT', '')), 'build-tools', '*'))
+          tools = sorted(tools, key=lambda p: tuple(int(x) for x in re.findall(r'\d+', os.path.basename(p))), reverse=True)
+          if not tools:
               sys.exit('На исполнителе GitHub Actions не найден Android SDK Build Tools.')
           build = next((p for p in tools if os.path.isfile(os.path.join(p, 'aapt2')) and os.path.isfile(os.path.join(p, 'apksigner'))), None)
           if not build:
